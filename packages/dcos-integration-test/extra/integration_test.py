@@ -382,7 +382,7 @@ class Cluster:
                 'type': 'DOCKER',
                 'docker': {
                     'image': '{}/test_server'.format(self.registry),
-                    'forcePullImage': True,
+                    'forcePullImage': True
                 },
             },
             'cmd': '/opt/test_server.py 9080',
@@ -408,21 +408,25 @@ class Cluster:
 
         if docker_network_bridge:
             base_app['container']['docker']['portMappings'] = [{
-                'containerPort':  9080,
-                'hostPort': 0,
-                'servicePort': 0,
-                'protocol': 'tcp',
-            }]
+                                                                    'hostPort': 0,
+                                                                    'containerPort': 9080,
+                                                                    'protocol': 'tcp',
+                                                                    'name': 'test',
+                                                                    'labels': {}
+                                                                }]
             if ip_per_container:
                 base_app['container']['docker']['network'] = 'USER'
                 base_app['ipAddress'] = {'networkName': 'dcos'}
             else:
                 base_app['container']['docker']['network'] = 'BRIDGE'
-                base_app['ports'] = []
         else:
+            base_app['portDefinitions'] = [{
+                                                "protocol": "tcp",
+                                                "port": 0,
+                                                "name": "test"
+                                            }]
             base_app['cmd'] = '/opt/test_server.py $PORT0'
             base_app['container']['docker']['network'] = 'HOST'
-            base_app['ports'] = [0]
 
         return base_app, test_uuid
 
@@ -1031,79 +1035,56 @@ def test_octarine_srv(cluster, timeout=30):
     cluster.deploy_marathon_app(app_definition)
 
 
-# By default telemetry-net sends the metrics about once a minute
-# Therefore, we wait up till 2 minutes and a bit before we give up
-def test_if_minuteman_routes_to_vip(cluster, timeout=125):
-    """Test if we are able to connect to a task with a vip using minuteman.
-    """
-    # Launch the app and proxy
-    test_uuid = uuid.uuid4().hex
-
-    app_definition = {
-        'id': "/integration-test-app-with-minuteman-vip-%s" % test_uuid,
-        'cpus': 0.1,
-        'mem': 128,
-        'cmd': 'touch imok && /opt/mesosphere/bin/python -mhttp.server ${PORT0}',
-        'portDefinitions': [
-            {
-                'port': 0,
-                'protocol': 'tcp',
-                'name': 'test',
-                'labels': {
-                    'VIP_0': '1.2.3.4:5000'
-                }
-            }
-        ],
-        'uris': [],
-        'instances': 1,
-        'healthChecks': [{
-            'protocol': 'HTTP',
-            'path': '/',
-            'portIndex': 0,
-            'gracePeriodSeconds': 5,
-            'intervalSeconds': 10,
-            'timeoutSeconds': 10,
-            'maxConsecutiveFailures': 3
-        }]
-    }
-
-    cluster.deploy_marathon_app(app_definition)
-
-    proxy_definition = {
-        'id': "/integration-test-proxy-to-minuteman-vip-%s" % test_uuid,
-        'cpus': 0.1,
-        'mem': 128,
-        'ports': [0],
-        'cmd': 'chmod 755 ncat && ./ncat -v --sh-exec "./ncat 1.2.3.4 5000" -l $PORT0 --keep-open',
-        'uris': ['https://s3.amazonaws.com/sargun-mesosphere/ncat'],
-        'instances': 1,
-        'healthChecks': [{
-            'protocol': 'COMMAND',
-            'command': {
-                'value': 'curl -f -X GET http://$HOST:$PORT0/'
-            },
-            'gracePeriodSeconds': 0,
-            'intervalSeconds': 5,
-            'timeoutSeconds': 20,
-            'maxConsecutiveFailures': 3,
-            'ignoreHttp1xx': False
-        }],
-    }
-
-    service_points = cluster.deploy_marathon_app(proxy_definition)
-
+def ensure_routable(cmd, service_points, timeout=125):
     @retrying.retry(wait_fixed=2000,
                     stop_max_delay=timeout*1000,
                     retry_on_result=lambda ret: ret is False,
-                    retry_on_exception=lambda x: False)
+                    retry_on_exception=lambda x: True)
     def _ensure_routable():
-        r = requests.get('http://{}:{}'.format(service_points[0].host,
-                                               service_points[0].port))
-        assert(r.ok)
-        data = r.text
-        assert 'imok' in data
+        proxy_uri = 'http://{}:{}/run_cmd'.format(service_points[0].host, service_points[0].port)
+        logging.info('Sending {} data: {}'.format(proxy_uri, cmd))
+        r = requests.post(proxy_uri, data=cmd)
+        logging.info('Requests Response: %s', repr(r.json()))
+        assert(r.json()['status'] == 0)
+    return _ensure_routable
 
-    _ensure_routable()
+
+def test_if_minuteman_routes_to_vip(registry_cluster):
+    """Test if we are able to connect to a task with a vip using minuteman.
+    """
+
+    cluster = registry_cluster
+    origin_app, origin_uuid = cluster.get_base_testapp_definition()
+    origin_app['container']['docker']['portMappings'][0]['labels']['VIP_0'] = '1.2.3.4:5000'
+    cluster.deploy_marathon_app(origin_app)
+
+    proxy_app, proxy_uuid = cluster.get_base_testapp_definition()
+    service_points = cluster.deploy_marathon_app(proxy_app)
+
+    cmd = 'curl -s -f -m 5 http://1.2.3.4:5000/ping'
+    ensure_routable(cmd, service_points)()
+
+    cluster.destroy_marathon_app(origin_app['id'])
+    cluster.destroy_marathon_app(proxy_app['id'])
+
+
+def test_if_minuteman_routes_to_named_vip(registry_cluster):
+    """Test if we are able to connect to a task with a named vip using minuteman.
+    """
+
+    cluster = registry_cluster
+    origin_app, origin_uuid = cluster.get_base_testapp_definition()
+    origin_app['container']['docker']['portMappings'][0]['labels']['VIP_0'] = 'foo:5000'
+    cluster.deploy_marathon_app(origin_app)
+
+    proxy_app, proxy_uuid = cluster.get_base_testapp_definition()
+    service_points = cluster.deploy_marathon_app(proxy_app)
+
+    cmd = 'curl -s -f -m 5 http://foo.marathon.l4lb.thisdcos.directory:5000/ping'
+    ensure_routable(cmd, service_points)()
+
+    cluster.destroy_marathon_app(origin_app['id'])
+    cluster.destroy_marathon_app(proxy_app['id'])
 
 
 def test_ip_per_container(registry_cluster):
@@ -1114,24 +1095,19 @@ def test_ip_per_container(registry_cluster):
 
     app_definition, test_uuid = cluster.get_base_testapp_definition(ip_per_container=True)
 
-    app_definition['constraints'] = [['hostname', 'UNIQUE']]
+    app_definition['instances'] = 2
     if len(cluster.slaves) >= 2:
-        app_definition['instances'] = 2
+        app_definition['constraints'] = [['hostname', 'UNIQUE']]
     else:
         logging.warning('The IP Per Container tests needs 2 (private) agents to work')
     service_points = cluster.deploy_marathon_app(app_definition, check_health=False)
 
-    @retrying.retry(wait_fixed=5000, stop_max_delay=300*1000,
-                    retry_on_result=lambda ret: ret is False,
-                    retry_on_exception=lambda x: False)
-    def _ensure_works():
-        app_port = app_definition['container']['docker']['portMappings'][0]['containerPort']
-        cmd = "curl -s -f http://{}:{}/ping".format(service_points[0].ip, app_port)
-        r = requests.post('http://{}:{}/run_cmd'.format(service_points[1].host, service_points[1].port), data=cmd)
-        logging.info('IP Per Container Curl Response: %s', repr(r.json()))
-        assert(r.json()['status'] == 0)
+    # App instance 1 is the backend
+    # App instance 0 acts as the proxy
+    app_port = app_definition['container']['docker']['portMappings'][0]['containerPort']
+    cmd = 'curl -s -f -m 5 http://{}:{}/ping'.format(service_points[1].ip, app_port)
+    ensure_routable(cmd, service_points)()
 
-    _ensure_works()
     cluster.destroy_marathon_app(app_definition['id'])
 
 
